@@ -46,16 +46,13 @@ def main():
     parser.add_argument("--scan", action="store_true", help="Run the scanner (generator will run first if needed)")
     args = parser.parse_args()
 
-    # Set Supabase environment
     config = load_db_config()
     os.environ["SUPABASE_URL"] = config["SUPABASE_URL"]
     os.environ["SUPABASE_KEY"] = config["SUPABASE_KEY"]
 
-    # Fetch Google Drive credentials from the database
     supabase = create_supabase_client()
     creds_json, token_json, folder_id = fetch_drive_credentials(supabase)
 
-    # Set environment variables for the generator and scanner
     if creds_json:
         os.environ["DRIVE_CREDENTIALS"] = creds_json
     if token_json:
@@ -63,21 +60,18 @@ def main():
     if folder_id:
         os.environ["DRIVE_FOLDER_ID"] = folder_id
 
-    # Determine what to run
     run_generator = False
     run_scanner = False
 
     if args.generate:
         run_generator = True
     elif args.scan:
-        run_generator = True  # scanner needs generator to prepare files
+        run_generator = True
         run_scanner = True
     else:
-        # Default: run both
         run_generator = True
         run_scanner = True
 
-    # Run generator if requested
     if run_generator:
         print("Running generator...")
         gen_result = subprocess.run(["python3", "-m", "src.generator"])
@@ -87,7 +81,6 @@ def main():
         else:
             print("Generator completed successfully.")
 
-    # Run scanner if requested (and generator succeeded)
     if run_scanner:
         print("Starting scanner (src.brute)...")
         subprocess.run(["python3", "-m", "src.brute"], check=True)
