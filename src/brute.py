@@ -317,12 +317,12 @@ async def main():
                     ).execute()
                     files = results.get("files", [])
 
+                    # --- Exit if no files found ---
                     if not files:
-                        print("No seed files found. Sleeping 30s...")
-                        await asyncio.sleep(30)
-                        continue
+                        print("No seed files found. Exiting.")
+                        break
 
-                    # Sort files by name (optional) to process in order
+                    # Sort files by name to process in order
                     files.sort(key=lambda x: x["name"])
                     for file_meta in files:
                         await process_batch_file(
