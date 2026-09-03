@@ -7,21 +7,23 @@ import math
 import signal
 import time
 import random
+import json
+import io
 from concurrent.futures import ProcessPoolExecutor, as_completed
-import dropbox
 from mnemonic import Mnemonic
 from supabase import create_client
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
 
 # ----------------------------------------------------------------------
 # Environment & Constants
 # ----------------------------------------------------------------------
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-DROPBOX_ACCESS_TOKEN = os.getenv("DROPBOX_ACCESS_TOKEN")
-DROPBOX_FOLDER_PATH = os.getenv("DROPBOX_FOLDER_PATH", "/")
-DROPBOX_APP_KEY = os.getenv("DROPBOX_APP_KEY")
-DROPBOX_APP_SECRET = os.getenv("DROPBOX_APP_SECRET")
-DROPBOX_REFRESH_TOKEN = os.getenv("DROPBOX_REFRESH_TOKEN")
+DRIVE_CREDENTIALS = os.getenv("DRIVE_CREDENTIALS")
+DRIVE_TOKEN = os.getenv("DRIVE_TOKEN")
+DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
 
 # Process this many permutation indexes per output file
 PERMUTATIONS_PER_FILE = 1_000_000
@@ -126,58 +128,64 @@ def set_previous_seed_phrases(seed_str):
         print(f"Failed to set previous seed phrases: {e}")
 
 # ----------------------------------------------------------------------
-# Dropbox client
+# Google Drive helpers
 # ----------------------------------------------------------------------
-def get_dropbox_client():
-    if DROPBOX_REFRESH_TOKEN and DROPBOX_APP_KEY and DROPBOX_APP_SECRET:
-        try:
-            return dropbox.Dropbox(
-                oauth2_refresh_token=DROPBOX_REFRESH_TOKEN,
-                app_key=DROPBOX_APP_KEY,
-                app_secret=DROPBOX_APP_SECRET,
-            )
-        except Exception as e:
-            print(f"Failed to create Dropbox client with refresh token: {e}")
-            sys.exit(1)
-    elif DROPBOX_ACCESS_TOKEN:
-        print("WARNING: Using short‑lived access token; it may expire.")
-        return dropbox.Dropbox(DROPBOX_ACCESS_TOKEN)
-    else:
-        print("ERROR: No Dropbox credentials found.")
-        sys.exit(1)
+def get_drive_service():
+    """
+    Build and return a Google Drive service object using credentials from environment.
+    The credentials are expected to be JSON strings stored in DRIVE_CREDENTIALS and DRIVE_TOKEN.
+    """
+    if not DRIVE_CREDENTIALS or not DRIVE_TOKEN or not DRIVE_FOLDER_ID:
+        raise RuntimeError("Missing Google Drive environment variables (DRIVE_CREDENTIALS, DRIVE_TOKEN, DRIVE_FOLDER_ID)")
 
-# ----------------------------------------------------------------------
-# Upload helper with indefinite retry
-# ----------------------------------------------------------------------
-def upload_with_retry(dbx, content, path, max_retries=10):
+    # Parse token JSON (contains access_token, refresh_token, client_id, client_secret, etc.)
+    token_info = json.loads(DRIVE_TOKEN)
+    creds = Credentials.from_authorized_user_info(info=token_info, scopes=["https://www.googleapis.com/auth/drive.file"])
+
+    # If credentials are expired, refresh (this happens automatically if we use the credentials object)
+    # The Credentials object handles refresh internally if we use it with build()
+    service = build("drive", "v3", credentials=creds)
+    return service
+
+def upload_file_with_retry(service, content, filename, folder_id, max_retries=10):
+    """
+    Upload a text file to Google Drive with exponential backoff.
+    """
     retries = 0
     while retries < max_retries:
         try:
-            dbx.files_upload(content.encode('utf-8'), path,
-                             mode=dropbox.files.WriteMode.overwrite,
-                             mute=True)
+            # Prepare metadata
+            file_metadata = {
+                "name": filename,
+                "parents": [folder_id]
+            }
+            # Use in-memory bytes
+            media = MediaIoBaseUpload(
+                io.BytesIO(content.encode("utf-8")),
+                mimetype="text/plain",
+                resumable=True
+            )
+            # Upload
+            file = service.files().create(
+                body=file_metadata,
+                media_body=media,
+                fields="id"
+            ).execute()
             return True
-        except dropbox.exceptions.ApiError as e:
-            if e.error.is_path() and e.error.get_path().is_conflict():
-                print(f"Upload conflict for {path}, skipping.")
-                return True
-            elif e.error.is_rate_limit():
+        except Exception as e:
+            # Check for rate limit or other retriable errors
+            if "rateLimitExceeded" in str(e) or "userRateLimitExceeded" in str(e) or "quotaExceeded" in str(e):
                 wait = 2 ** retries + random.uniform(0, 1)
-                print(f"Rate limit hit for {path}, retrying in {wait:.2f}s...")
+                print(f"Rate limit hit for {filename}, retrying in {wait:.2f}s...")
                 time.sleep(wait)
                 retries += 1
                 continue
             else:
-                print(f"Upload failed for {path}: {e}")
+                print(f"Upload failed for {filename}: {e}")
                 retries += 1
                 time.sleep(2 ** retries)
                 continue
-        except Exception as e:
-            print(f"Upload error for {path}: {e}")
-            retries += 1
-            time.sleep(2 ** retries)
-            continue
-    print(f"Failed to upload {path} after {max_retries} retries.")
+    print(f"Failed to upload {filename} after {max_retries} retries.")
     return False
 
 # ----------------------------------------------------------------------
@@ -187,17 +195,18 @@ def worker(start_idx, count, worker_id, run_id, stop_event, seed_words, total_pe
     """
     Worker processes count permutation indexes, starting from start_idx.
     It chunks them into groups of PERMUTATIONS_PER_FILE, collects valid seeds,
-    and uploads the resulting file(s). Progress is only advanced after upload.
+    and uploads the resulting file(s) to Google Drive. Progress is only advanced after upload.
     """
-    dbx = get_dropbox_client()
-    folder_path = DROPBOX_FOLDER_PATH.rstrip('/')
+    # Each worker needs its own Drive service
+    service = get_drive_service()
+    folder_id = DRIVE_FOLDER_ID
     words = seed_words[:]
     mnemo = Mnemonic("english")
 
     # We'll process ranges sequentially
     current = start_idx
     remaining = count
-    pending = []  # (content, filename, path, chunk_size)
+    pending = []  # (content, filename, chunk_size)
 
     while remaining > 0 and not stop_event.is_set():
         # Determine chunk size for this iteration
@@ -227,8 +236,7 @@ def worker(start_idx, count, worker_id, run_id, stop_event, seed_words, total_pe
             file_counter = chunk_start // PERMUTATIONS_PER_FILE + 1  # just a unique counter
             filename = f"seeds_{run_id}_w{worker_id}_{file_counter:08d}_{len(valid_seeds)}.txt"
             content = "\n".join(valid_seeds)
-            path = f"{folder_path}/{filename}"
-            pending.append((content, filename, path, chunk_size))
+            pending.append((content, filename, chunk_size))
         else:
             # No seeds in this chunk – we can mark progress immediately
             update_progress(chunk_size, total_perms)
@@ -242,9 +250,9 @@ def worker(start_idx, count, worker_id, run_id, stop_event, seed_words, total_pe
         if len(pending) >= UPLOAD_BATCH_SIZE:
             total_uploaded = 0
             total_increment = 0
-            for content, fname, path, csize in pending:
+            for content, fname, csize in pending:
                 print(f"Worker {worker_id} uploading {fname}...")
-                success = upload_with_retry(dbx, content, path)
+                success = upload_file_with_retry(service, content, fname, folder_id)
                 if success:
                     print(f"Worker {worker_id} uploaded {fname}")
                     total_uploaded += 1
@@ -253,7 +261,7 @@ def worker(start_idx, count, worker_id, run_id, stop_event, seed_words, total_pe
                     # Should not happen because upload_with_retry retries indefinitely,
                     # but if it does, we block until success.
                     print(f"Worker {worker_id} FAILED to upload {fname} – retrying indefinitely...")
-                    while not upload_with_retry(dbx, content, path, max_retries=100):
+                    while not upload_file_with_retry(service, content, fname, folder_id, max_retries=100):
                         time.sleep(5)
                     total_uploaded += 1
                     total_increment += csize
@@ -268,14 +276,14 @@ def worker(start_idx, count, worker_id, run_id, stop_event, seed_words, total_pe
     # After loop, handle any remaining pending files
     if pending and not stop_event.is_set():
         total_increment = 0
-        for content, fname, path, csize in pending:
+        for content, fname, csize in pending:
             print(f"Worker {worker_id} uploading final {fname}...")
-            success = upload_with_retry(dbx, content, path)
+            success = upload_file_with_retry(service, content, fname, folder_id)
             if success:
                 print(f"Worker {worker_id} uploaded {fname}")
                 total_increment += csize
             else:
-                while not upload_with_retry(dbx, content, path, max_retries=100):
+                while not upload_file_with_retry(service, content, fname, folder_id, max_retries=100):
                     time.sleep(5)
                 total_increment += csize
         if total_increment > 0:
@@ -293,8 +301,8 @@ def main():
     if not all([SUPABASE_URL, SUPABASE_KEY]):
         print("ERROR: Supabase credentials missing.")
         sys.exit(1)
-    if not (DROPBOX_ACCESS_TOKEN or (DROPBOX_REFRESH_TOKEN and DROPBOX_APP_KEY and DROPBOX_APP_SECRET)):
-        print("ERROR: Missing Dropbox credentials.")
+    if not (DRIVE_CREDENTIALS and DRIVE_TOKEN and DRIVE_FOLDER_ID):
+        print("ERROR: Missing Google Drive environment variables.")
         sys.exit(1)
 
     try:
