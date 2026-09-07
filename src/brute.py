@@ -34,10 +34,10 @@ TRON_API_FILE = "TRON_api.txt"
 ETH_RESPONSE_FILE = "ETH_scan_response.json"
 TRON_RESPONSE_FILE = "TRON_scan_response.json"
 
-MAX_CONCURRENT = 800
+MAX_CONCURRENT = 450
 BATCH_WRITE_INTERVAL = 100
 MIN_API_KEYS = 1
-PROGRESS_CHUNK_SIZE = 1000   # update database every 1000 seeds scanned
+PROGRESS_CHUNK_SIZE = 2000
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -76,21 +76,17 @@ def get_scan_progress(file_id):
     row_id = get_row_id()
     res = supabase.table("brute").select("scan_progress").eq("id", row_id).execute()
     if res.data and res.data[0].get("scan_progress"):
-        progress_dict = res.data[0]["scan_progress"]
-        return progress_dict.get(file_id, 0)
+        return res.data[0]["scan_progress"].get(file_id, 0)
     return 0
 
-def update_scan_progress(file_id, progress, total_seeds=None):
+def update_scan_progress(file_id, progress):
     supabase = get_supabase()
     row_id = get_row_id()
-    # Get current progress dict
     res = supabase.table("brute").select("scan_progress").eq("id", row_id).execute()
     current = res.data[0].get("scan_progress", {}) if res.data else {}
     if not isinstance(current, dict):
         current = {}
     current[file_id] = progress
-    # Optionally store total seeds as well (not required but could be useful)
-    # We'll just store progress.
     supabase.table("brute").update({"scan_progress": current}).eq("id", row_id).execute()
 
 def delete_scan_progress(file_id):
@@ -164,15 +160,17 @@ def derive_tron_addresses(seed_phrase):
     except Exception:
         return []
 
-# ------------------ NETWORK / REQUESTS ------------------
+# ------------------ NETWORK / REQUESTS (1s jitter) ------------------
 async def robust_request(session, url, headers=None):
-    await asyncio.sleep(random.uniform(1.0, 3.0))
+    # 1‑second jitter to spread requests evenly (0.5–1.5s)
+    await asyncio.sleep(random.uniform(0.5, 0.8))
     while True:
         try:
             async with session.get(url, headers=headers, timeout=30) as r:
                 status = r.status
                 text = await r.text()
                 if status == 429:
+                    # Rate limit – wait longer and retry
                     await asyncio.sleep(random.uniform(2.0, 5.0))
                     continue
                 if status != 200:
@@ -273,11 +271,8 @@ async def scan_seed(seed, eth_key, tron_key, session, writer, eth_sem, tron_sem)
 # ------------------ PROCESS A CHUNK OF SEEDS ------------------
 async def process_seed_chunk(seeds, eth_mgr, tron_mgr, session, writer,
                              eth_sem, tron_sem, start_offset, file_id, total_seeds):
-    """
-    Process a chunk of seeds and update progress after completion.
-    """
     tasks = []
-    for i, seed in enumerate(seeds):
+    for seed in seeds:
         eth_key = await eth_mgr.get_n_keys(1)
         tron_key = await tron_mgr.get_n_keys(1)
         task = asyncio.create_task(
@@ -288,7 +283,6 @@ async def process_seed_chunk(seeds, eth_mgr, tron_mgr, session, writer,
     await asyncio.gather(*tasks)
     await writer.flush()
 
-    # Update progress after this chunk
     new_progress = start_offset + len(seeds)
     update_scan_progress(file_id, new_progress)
 
@@ -303,7 +297,6 @@ async def process_batch_file(service, file_metadata, eth_mgr, tron_mgr, session,
     file_name = file_metadata["name"]
     print(f"Processing file: {file_name}")
 
-    # Download file
     try:
         request = service.files().get_media(fileId=file_id)
         fh = io.BytesIO()
@@ -311,8 +304,6 @@ async def process_batch_file(service, file_metadata, eth_mgr, tron_mgr, session,
         done = False
         while not done:
             status, done = downloader.next_chunk()
-            if status:
-                print(f"Download {int(status.progress() * 100)}% complete.")
         content = fh.getvalue().decode("utf-8")
         seeds = [line.strip() for line in content.splitlines() if line.strip()]
     except Exception as e:
@@ -339,7 +330,6 @@ async def process_batch_file(service, file_metadata, eth_mgr, tron_mgr, session,
 
     print(f"Scanning {len(seeds)} remaining seeds...")
 
-    # Process in chunks
     for chunk_start in range(0, len(seeds), PROGRESS_CHUNK_SIZE):
         chunk_end = min(chunk_start + PROGRESS_CHUNK_SIZE, len(seeds))
         chunk = seeds[chunk_start:chunk_end]
@@ -349,10 +339,8 @@ async def process_batch_file(service, file_metadata, eth_mgr, tron_mgr, session,
             progress + chunk_start, file_id, total_seeds
         )
 
-    # ---- All seeds scanned ----
     delete_scan_progress(file_id)
 
-    # ---- Call the scanner to detect active wallets ----
     try:
         from src.scanner import process_scanner
         print("Calling scanner to detect active wallets...")
@@ -363,7 +351,6 @@ async def process_batch_file(service, file_metadata, eth_mgr, tron_mgr, session,
     except Exception as e:
         print(f"Scanner error: {e}")
 
-    # ---- Delete the file from Google Drive with indefinite retry ----
     retries = 0
     while True:
         try:
