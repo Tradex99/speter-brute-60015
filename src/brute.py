@@ -34,14 +34,7 @@ TRON_API_FILE = "TRON_api.txt"
 ETH_RESPONSE_FILE = "ETH_scan_response.json"
 TRON_RESPONSE_FILE = "TRON_scan_response.json"
 
-# Per-key rate limits (tune to your provider's real limits)
-ETH_CALLS_PER_SECOND_PER_KEY = 5
-TRON_CALLS_PER_SECOND_PER_KEY = 13
-
-ETH_BATCH_SIZE = 20                # Etherscan balancemulti max per call
-MAX_CONCURRENT_ETH_BATCHES = 200
-MAX_CONCURRENT_TRON = 300
-
+MAX_CONCURRENT = 500
 BATCH_WRITE_INTERVAL = 100
 MIN_API_KEYS = 1
 PROGRESS_CHUNK_SIZE = 2000
@@ -116,34 +109,21 @@ def get_drive_service():
     service = build("drive", "v3", credentials=creds)
     return service
 
-# ------------------ PER-KEY RATE LIMITER ------------------
-class PerKeyRateLimiter:
-    """
-    Round-robins across keys, but also enforces a minimum interval between
-    successive uses of the SAME key. This prevents several concurrent tasks
-    from hitting the same key at once and triggering 429 backoff churn.
-    """
-    def __init__(self, keys, calls_per_second):
-        if not keys:
-            raise ValueError("No keys provided")
+# ------------------ API KEY ROTATING MANAGER ------------------
+class RotatingBatchManager:
+    def __init__(self, keys):
         self.keys = keys
-        self.min_interval = 1.0 / calls_per_second
-        self.last_call = {k: 0.0 for k in keys}
-        self.locks = {k: asyncio.Lock() for k in keys}
         self.pointer = 0
-        self.pointer_lock = asyncio.Lock()
+        self.lock = asyncio.Lock()
 
-    async def acquire(self):
-        async with self.pointer_lock:
-            key = self.keys[self.pointer]
-            self.pointer = (self.pointer + 1) % len(self.keys)
-        async with self.locks[key]:
-            now = time.monotonic()
-            wait = self.last_call[key] + self.min_interval - now
-            if wait > 0:
-                await asyncio.sleep(wait)
-            self.last_call[key] = time.monotonic()
-        return key
+    async def get_n_keys(self, n):
+        keys = []
+        async with self.lock:
+            for _ in range(n):
+                key = self.keys[self.pointer]
+                self.pointer = (self.pointer + 1) % len(self.keys)
+                keys.append(key)
+        return keys
 
 def read_api_keys(path):
     try:
@@ -154,76 +134,65 @@ def read_api_keys(path):
         if not keys:
             print(f"ERROR: No API keys in {path}")
             return None
-        return keys
+        return RotatingBatchManager(keys)
     except Exception as e:
         print(f"Error reading {path}: {e}")
         return None
 
 # ------------------ DERIVATION FUNCTIONS ------------------
-def derive_eth_address(seed_phrase):
+def derive_eth_addresses(seed_phrase):
     try:
         seed_bytes = Bip39SeedGenerator(seed_phrase).Generate()
         bip44_m = Bip44.FromSeed(seed_bytes, Bip44Coins.ETHEREUM)
-        return bip44_m.Purpose().Coin().Account(0).Change(Bip44Changes.CHAIN_EXT).AddressIndex(0).PublicKey().ToAddress()
+        return [
+            bip44_m.Purpose().Coin().Account(0).Change(Bip44Changes.CHAIN_EXT).AddressIndex(0).PublicKey().ToAddress()
+        ]
     except Exception:
-        return None
+        return []
 
-def derive_tron_address(seed_phrase):
+def derive_tron_addresses(seed_phrase):
     try:
         seed_bytes = Bip39SeedGenerator(seed_phrase).Generate()
         bip44_m = Bip44.FromSeed(seed_bytes, Bip44Coins.TRON)
-        return bip44_m.Purpose().Coin().Account(0).Change(Bip44Changes.CHAIN_EXT).AddressIndex(0).PublicKey().ToAddress()
+        return [
+            bip44_m.Purpose().Coin().Account(0).Change(Bip44Changes.CHAIN_EXT).AddressIndex(0).PublicKey().ToAddress()
+        ]
     except Exception:
-        return None
+        return []
 
-# ------------------ NETWORK / REQUESTS ------------------
-async def robust_request(session, url, headers=None, max_retries=8):
-    attempt = 0
-    while attempt < max_retries:
+# ------------------ NETWORK / REQUESTS (1s jitter) ------------------
+async def robust_request(session, url, headers=None):
+    # 1‑second jitter to spread requests evenly (0.5–1.5s)
+    await asyncio.sleep(random.uniform(0.5, 0.8))
+    while True:
         try:
             async with session.get(url, headers=headers, timeout=30) as r:
                 status = r.status
                 text = await r.text()
                 if status == 429:
-                    attempt += 1
+                    # Rate limit – wait longer and retry
                     await asyncio.sleep(random.uniform(2.0, 5.0))
                     continue
                 if status != 200:
-                    attempt += 1
                     await asyncio.sleep(random.uniform(0.5, 1.5))
                     continue
                 try:
-                    return json.loads(text)
+                    data = json.loads(text)
                 except Exception:
-                    attempt += 1
                     await asyncio.sleep(random.uniform(0.5, 1.0))
                     continue
+                return data
         except asyncio.CancelledError:
             raise
         except Exception:
-            attempt += 1
             await asyncio.sleep(random.uniform(0.5, 1.5))
-    return None
 
-async def check_eth_balances_multi(session, addresses, api_key):
-    """Batch balance check for up to ETH_BATCH_SIZE addresses in one call."""
+async def check_eth_balance(session, address, api_key):
     api_call_counter["eth"] += 1
-    joined = ",".join(addresses)
-    url = (
-        f"https://api.etherscan.io/v2/api?chainid=1&module=account"
-        f"&action=balancemulti&address={joined}&tag=latest&apikey={api_key}"
-    )
+    url = f"https://api.etherscan.io/v2/api?chainid=1&module=account&action=balance&address={address}&tag=latest&apikey={api_key}"
     data = await robust_request(session, url)
-    results = {}
-    if data and data.get("status") == "1" and isinstance(data.get("result"), list):
-        for entry in data["result"]:
-            addr = entry.get("account")
-            try:
-                bal = int(entry.get("balance", 0)) / 1e18
-            except (TypeError, ValueError):
-                bal = 0.0
-            results[addr] = bal
-    return results, data
+    balance = int(data.get("result", 0)) / 1e18 if data.get("status") == "1" else 0.0
+    return balance, data
 
 async def check_trx_account(session, address, api_key):
     api_call_counter["tron"] += 1
@@ -246,16 +215,14 @@ class BatchWriter:
         self.tron_lock = asyncio.Lock()
         self.counter = 0
 
-    async def add_eth(self, entries):
+    async def add(self, eth_entry, tron_entry):
         async with self.eth_lock:
-            self.eth_buffer.extend(entries)
-        self.counter += len(entries)
-        if self.counter % self.interval < len(entries):
-            await self.flush()
-
-    async def add_tron(self, entry):
+            self.eth_buffer.append(eth_entry)
         async with self.tron_lock:
-            self.tron_buffer.append(entry)
+            self.tron_buffer.append(tron_entry)
+        self.counter += 1
+        if self.counter % self.interval == 0:
+            await self.flush()
 
     async def flush(self):
         if self.eth_buffer:
@@ -273,57 +240,47 @@ class BatchWriter:
                 for entry in to_write:
                     f.write(json.dumps(entry, separators=(",", ":")) + "\n")
 
-# ------------------ ETH: BATCHED SCAN ------------------
-async def scan_eth_batch(seeds, eth_limiter, session, writer, sem):
-    async with sem:
-        addr_map = {}
-        for seed in seeds:
-            addr = derive_eth_address(seed)
-            if addr:
-                addr_map[addr] = seed
-        if not addr_map:
-            return
-        addresses = list(addr_map.keys())
-        key = await eth_limiter.acquire()
-        balances, _raw = await check_eth_balances_multi(session, addresses, key)
+# ------------------ SINGLE SEED SCAN ------------------
+async def scan_seed(seed, eth_key, tron_key, session, writer, eth_sem, tron_sem):
+    async with eth_sem, tron_sem:
+        eth_addresses = derive_eth_addresses(seed)
+        tron_addresses = derive_tron_addresses(seed)
 
-        entries = []
-        for addr in addresses:
-            bal = balances.get(addr, 0.0)
-            entries.append({
-                "seed": addr_map[addr],
+        eth_responses = []
+        for addr in eth_addresses:
+            balance, bal_resp = await check_eth_balance(session, addr, eth_key)
+            eth_responses.append({
                 "address": addr,
-                "balance": bal,
-                "timestamp": time.time(),
+                "balance": balance,
+                "balance_raw": bal_resp,
             })
-        await writer.add_eth(entries)
+        eth_entry = {"seed": seed, "eth": eth_responses, "timestamp": time.time()}
 
-# ------------------ TRON: PER-SEED SCAN ------------------
-async def scan_tron_seed(seed, tron_limiter, session, writer, sem):
-    async with sem:
-        addr = derive_tron_address(seed)
-        if not addr:
-            return
-        key = await tron_limiter.acquire()
-        balance, _raw = await check_trx_account(session, addr, key)
-        entry = {"seed": seed, "address": addr, "balance": balance, "timestamp": time.time()}
-        await writer.add_tron(entry)
+        tron_responses = []
+        for addr in tron_addresses:
+            balance, bal_resp = await check_trx_account(session, addr, tron_key)
+            tron_responses.append({
+                "address": addr,
+                "balance": balance,
+                "balance_raw": bal_resp,
+            })
+        tron_entry = {"seed": seed, "tron": tron_responses, "timestamp": time.time()}
+
+        await writer.add(eth_entry, tron_entry)
 
 # ------------------ PROCESS A CHUNK OF SEEDS ------------------
-async def process_seed_chunk(seeds, eth_limiter, tron_limiter, session, writer,
-                              eth_sem, tron_sem, start_offset, file_id):
+async def process_seed_chunk(seeds, eth_mgr, tron_mgr, session, writer,
+                             eth_sem, tron_sem, start_offset, file_id, total_seeds):
     tasks = []
-
-    # ETH: grouped into batches of ETH_BATCH_SIZE (1 API call per batch)
-    for i in range(0, len(seeds), ETH_BATCH_SIZE):
-        batch = seeds[i:i + ETH_BATCH_SIZE]
-        tasks.append(asyncio.create_task(scan_eth_batch(batch, eth_limiter, session, writer, eth_sem)))
-
-    # TRON: one call per seed (no batch endpoint available)
     for seed in seeds:
-        tasks.append(asyncio.create_task(scan_tron_seed(seed, tron_limiter, session, writer, tron_sem)))
+        eth_key = await eth_mgr.get_n_keys(1)
+        tron_key = await tron_mgr.get_n_keys(1)
+        task = asyncio.create_task(
+            scan_seed(seed, eth_key[0], tron_key[0], session, writer, eth_sem, tron_sem)
+        )
+        tasks.append(task)
 
-    await asyncio.gather(*tasks, return_exceptions=True)
+    await asyncio.gather(*tasks)
     await writer.flush()
 
     new_progress = start_offset + len(seeds)
@@ -331,12 +288,11 @@ async def process_seed_chunk(seeds, eth_limiter, tron_limiter, session, writer,
 
     global scanned_counter
     scanned_counter += len(seeds)
-    print(f"Scanned {scanned_counter} seeds so far... "
-          f"(eth calls: {api_call_counter['eth']}, tron calls: {api_call_counter['tron']})")
+    print(f"Scanned {scanned_counter} seeds so far...")
 
 # ------------------ PROCESS ONE BATCH FILE ------------------
-async def process_batch_file(service, file_metadata, eth_limiter, tron_limiter, session,
-                              writer, eth_sem, tron_sem):
+async def process_batch_file(service, file_metadata, eth_mgr, tron_mgr, session,
+                             writer, eth_sem, tron_sem):
     file_id = file_metadata["id"]
     file_name = file_metadata["name"]
     print(f"Processing file: {file_name}")
@@ -378,9 +334,9 @@ async def process_batch_file(service, file_metadata, eth_limiter, tron_limiter, 
         chunk_end = min(chunk_start + PROGRESS_CHUNK_SIZE, len(seeds))
         chunk = seeds[chunk_start:chunk_end]
         await process_seed_chunk(
-            chunk, eth_limiter, tron_limiter, session, writer,
+            chunk, eth_mgr, tron_mgr, session, writer,
             eth_sem, tron_sem,
-            progress + chunk_start, file_id
+            progress + chunk_start, file_id, total_seeds
         )
 
     delete_scan_progress(file_id)
@@ -412,25 +368,20 @@ async def main():
     global scanned_counter
     scanned_counter = 0
 
-    eth_keys = read_api_keys(ETH_API_FILE)
-    tron_keys = read_api_keys(TRON_API_FILE)
-    if not eth_keys or not tron_keys:
+    eth_mgr = read_api_keys(ETH_API_FILE)
+    tron_mgr = read_api_keys(TRON_API_FILE)
+    if not eth_mgr or not tron_mgr:
         print("ERROR: Missing API keys.")
         sys.exit(1)
 
-    eth_limiter = PerKeyRateLimiter(eth_keys, ETH_CALLS_PER_SECOND_PER_KEY)
-    tron_limiter = PerKeyRateLimiter(tron_keys, TRON_CALLS_PER_SECOND_PER_KEY)
-
     service = get_drive_service()
 
-    eth_sem = asyncio.Semaphore(MAX_CONCURRENT_ETH_BATCHES)
-    tron_sem = asyncio.Semaphore(MAX_CONCURRENT_TRON)
+    eth_sem = asyncio.Semaphore(MAX_CONCURRENT)
+    tron_sem = asyncio.Semaphore(MAX_CONCURRENT)
     writer = BatchWriter(ETH_RESPONSE_FILE, TRON_RESPONSE_FILE)
 
-    connector = aiohttp.TCPConnector(limit=0)  # don't let the pool cap concurrency
-
     try:
-        async with aiohttp.ClientSession(connector=connector) as session:
+        async with aiohttp.ClientSession() as session:
             while True:
                 try:
                     results = service.files().list(
@@ -448,7 +399,7 @@ async def main():
 
                     for file_meta in files:
                         await process_batch_file(
-                            service, file_meta, eth_limiter, tron_limiter, session,
+                            service, file_meta, eth_mgr, tron_mgr, session,
                             writer, eth_sem, tron_sem
                         )
 
